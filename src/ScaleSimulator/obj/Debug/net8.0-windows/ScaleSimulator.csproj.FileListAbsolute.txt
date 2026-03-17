@@ -33,3 +33,4 @@ F:\Freelance\02. Gestion de fardos\02. Simuladores\gestion_de_fardos_simuladores
 F:\Freelance\02. Gestion de fardos\02. Simuladores\gestion_de_fardos_simuladores\src\ScaleSimulator\obj\Debug\net8.0-windows\ScaleSimulator.pdb
 F:\Freelance\02. Gestion de fardos\02. Simuladores\gestion_de_fardos_simuladores\src\ScaleSimulator\obj\Debug\net8.0-windows\ScaleSimulator.genruntimeconfig.cache
 F:\Freelance\02. Gestion de fardos\02. Simuladores\gestion_de_fardos_simuladores\src\ScaleSimulator\obj\Debug\net8.0-windows\ref\ScaleSimulator.dll
+F:\Freelance\02. Gestion de fardos\02. Simuladores\gestion_de_fardos_simuladores\src\ScaleSimulator\obj\Debug\net8.0-windows\ScaleSimulator.sourcelink.json

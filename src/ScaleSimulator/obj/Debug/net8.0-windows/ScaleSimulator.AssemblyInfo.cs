@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ScaleSimulator")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+be4734d08444835e720194b723c7865fc38dd955")]
 [assembly: System.Reflection.AssemblyProductAttribute("ScaleSimulator")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ScaleSimulator")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

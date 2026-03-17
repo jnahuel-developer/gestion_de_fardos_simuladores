@@ -7,10 +7,11 @@ internal sealed class ScaleOptions
     public int DataBits { get; set; } = 8;
     public int StopBits { get; set; } = 1;
     public string Parity { get; set; } = "None";
-
     public int IntervalMs { get; set; } = 1000;
     public string? FilePath { get; set; }
     public string NewLineMode { get; set; } = "crlf";
+    public bool UseUi { get; set; }
+    public ButtonLineMode ButtonLine { get; set; } = ButtonLineMode.Rts;
 
     public static ScaleOptions Parse(string[] args)
     {
@@ -22,10 +23,16 @@ internal sealed class ScaleOptions
 
             if (!arg.StartsWith("--", StringComparison.OrdinalIgnoreCase))
             {
-                throw new ArgumentException($"Argumento inválido: '{arg}'.");
+                throw new ArgumentException($"Argumento invalido: '{arg}'.");
             }
 
             string key = arg[2..].Trim().ToLowerInvariant();
+
+            if (key == "ui")
+            {
+                options.UseUi = true;
+                continue;
+            }
 
             if (i + 1 >= args.Length)
             {
@@ -67,6 +74,10 @@ internal sealed class ScaleOptions
 
                 case "newline":
                     options.NewLineMode = value.ToLowerInvariant();
+                    break;
+
+                case "button-line":
+                    options.ButtonLine = ButtonLineHelper.Parse(value);
                     break;
 
                 default:
@@ -114,17 +125,19 @@ internal sealed class ScaleOptions
     public static string GetUsage()
     {
         return
-@"ScaleSimulator - Simulador local de balanza por puerto serie
+@"ScaleSimulator - Simulador local de balanza y pulsador por puerto serie
 
 Uso:
-  ScaleSimulator.exe --port COM11 [--interval-ms 1000] [--file weights.txt] [--newline crlf|lf]
-  dotnet run --project src/ScaleSimulator -- --port COM11 [--interval-ms 1000] [--file weights.txt] [--newline crlf|lf]
+  ScaleSimulator.exe --port COM3 [--interval-ms 1000] [--file weights.txt] [--newline crlf|lf] [--ui] [--button-line rts|dtr]
+  dotnet run --project src/ScaleSimulator -- --port COM3 [--interval-ms 1000] [--file weights.txt] [--newline crlf|lf] [--ui] [--button-line rts|dtr]
 
-Parámetros:
-  --port         Puerto COM del lado simulador. Obligatorio. Ej: COM11
-  --interval-ms  Intervalo entre envíos en milisegundos. Default: 1000
-  --file         Archivo con pesos en gramos, un número por línea. Opcional.
+Parametros:
+  --port         Puerto COM del lado simulador. Obligatorio. Ej: COM3
+  --interval-ms  Intervalo entre envios en milisegundos. Default: 1000
+  --file         Archivo con pesos en gramos, un numero por linea. Opcional.
   --newline      crlf o lf. Default: crlf
+  --ui           Abre la mini UI para disparar el pulsador manualmente.
+  --button-line  rts o dtr. Default: rts
 
 Opcionales avanzados:
   --baud         Baud rate. Default: 9600
@@ -133,8 +146,9 @@ Opcionales avanzados:
   --parity       None, Odd, Even, Mark, Space. Default: None
 
 Ejemplos:
-  ScaleSimulator.exe --port COM11
-  ScaleSimulator.exe --port COM11 --interval-ms 1000 --file .\samples\weights.txt --newline crlf
+  ScaleSimulator.exe --port COM3
+  ScaleSimulator.exe --port COM3 --ui --button-line rts
+  ScaleSimulator.exe --port COM3 --interval-ms 1000 --file .\samples\weights.txt --newline crlf
 ";
     }
 }

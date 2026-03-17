@@ -1,10 +1,12 @@
-using System.IO.Ports;
+using System.Windows.Forms;
 using ScaleSimulator;
 
 internal static class Program
 {
     private static volatile bool _stopRequested;
+    private static Form? _simulatorForm;
 
+    [STAThread]
     public static int Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -29,7 +31,6 @@ internal static class Program
             return 2;
         }
 
-        string newLine = NewLineHelper.Resolve(options.NewLineMode);
         WeightSource weightSource;
 
         try
@@ -42,166 +43,156 @@ internal static class Program
             return 3;
         }
 
-        using var serialPort = new SerialPort
-        {
-            PortName = options.PortName,
-            BaudRate = options.BaudRate,
-            DataBits = options.DataBits,
-            Parity = ParseParity(options.Parity),
-            StopBits = ParseStopBits(options.StopBits),
-            Handshake = Handshake.None,
-            Encoding = System.Text.Encoding.ASCII,
-            NewLine = newLine,
-            DtrEnable = false,
-            RtsEnable = false,
-            ReadTimeout = 500,
-            WriteTimeout = 2000
-        };
+        using var runtime = new ScaleSimulatorRuntime(options, weightSource);
+        runtime.LogEmitted += WriteLog;
 
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
+
+            if (_stopRequested)
+            {
+                return;
+            }
+
             _stopRequested = true;
-            WriteInfo("Se recibió Ctrl+C. Iniciando cierre limpio...");
+            WriteInfo("Se recibio Ctrl+C. Iniciando cierre limpio...");
+
+            if (_simulatorForm is not null && !_simulatorForm.IsDisposed)
+            {
+                try
+                {
+                    _simulatorForm.BeginInvoke(new Action(() => _simulatorForm.Close()));
+                }
+                catch
+                {
+                    // Se prioriza el cierre limpio del proceso.
+                }
+            }
         };
 
-        try
-        {
-            serialPort.Open();
-        }
-        catch (UnauthorizedAccessException)
-        {
-            WriteError($"No se pudo abrir el puerto {options.PortName}. Posible causa: puerto ocupado o sin permisos.");
-            return 4;
-        }
-        catch (IOException ex)
-        {
-            WriteError($"Error de I/O al abrir el puerto {options.PortName}: {ex.Message}");
-            return 5;
-        }
-        catch (Exception ex)
-        {
-            WriteError($"Error inesperado al abrir el puerto {options.PortName}: {ex.Message}");
-            return 6;
-        }
+        return options.UseUi
+            ? RunUi(runtime)
+            : RunHeadless(runtime);
+    }
 
-        WriteHeader(options);
+    private static int RunHeadless(ScaleSimulatorRuntime runtime)
+    {
+        int exitCode = TryStartRuntime(runtime);
+        if (exitCode != 0)
+        {
+            return exitCode;
+        }
 
         try
         {
             while (!_stopRequested)
             {
-                string weight = weightSource.Next();
-                string payload = weight + newLine;
-
-                try
-                {
-                    serialPort.Write(payload);
-                    WriteSent(options.PortName, weight);
-                }
-                catch (TimeoutException ex)
-                {
-                    WriteError($"Timeout escribiendo en {options.PortName}: {ex.Message}");
-                }
-                catch (IOException ex)
-                {
-                    WriteError($"Error de I/O escribiendo en {options.PortName}: {ex.Message}");
-                }
-                catch (InvalidOperationException ex)
-                {
-                    WriteError($"Puerto no disponible al escribir en {options.PortName}: {ex.Message}");
-                }
-
-                SleepRespectingStop(options.IntervalMs);
+                Thread.Sleep(100);
             }
+
+            return 0;
         }
         finally
         {
-            try
-            {
-                if (serialPort.IsOpen)
-                {
-                    serialPort.Close();
-                }
-            }
-            catch
-            {
-                // No se vuelve a lanzar para priorizar salida limpia.
-            }
-
-            WriteInfo($"Puerto {options.PortName} cerrado. Fin del simulador.");
-        }
-
-        return 0;
-    }
-
-    private static void SleepRespectingStop(int totalMs)
-    {
-        const int sliceMs = 100;
-
-        int remaining = totalMs;
-        while (!_stopRequested && remaining > 0)
-        {
-            int currentSlice = Math.Min(sliceMs, remaining);
-            Thread.Sleep(currentSlice);
-            remaining -= currentSlice;
+            runtime.Stop();
         }
     }
 
-    private static Parity ParseParity(string value)
+    private static int RunUi(ScaleSimulatorRuntime runtime)
     {
-        if (Enum.TryParse<Parity>(value, ignoreCase: true, out var parity))
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+
+        using var form = new SimulatorForm(runtime);
+        _simulatorForm = form;
+        form.FormClosed += (_, _) => _stopRequested = true;
+
+        int exitCode = TryStartRuntime(runtime);
+        if (exitCode != 0)
         {
-            return parity;
+            _simulatorForm = null;
+            return exitCode;
         }
 
-        throw new ArgumentException(
-            $"Valor de paridad inválido: '{value}'. Valores soportados: None, Odd, Even, Mark, Space.");
-    }
-
-    private static StopBits ParseStopBits(int value)
-    {
-        return value switch
+        try
         {
-            1 => StopBits.One,
-            2 => StopBits.Two,
-            _ => throw new ArgumentException("El valor de --stopbits debe ser 1 o 2.")
-        };
+            Application.Run(form);
+            return 0;
+        }
+        finally
+        {
+            _simulatorForm = null;
+            runtime.Stop();
+        }
     }
 
-    private static void WriteHeader(ScaleOptions options)
+    private static int TryStartRuntime(ScaleSimulatorRuntime runtime)
     {
-        WriteInfo("==============================================");
-        WriteInfo("ScaleSimulator - Simulador local de balanza");
-        WriteInfo("==============================================");
-        WriteInfo($"Puerto       : {options.PortName}");
-        WriteInfo($"BaudRate     : {options.BaudRate}");
-        WriteInfo($"DataBits     : {options.DataBits}");
-        WriteInfo($"Parity       : {options.Parity}");
-        WriteInfo($"StopBits     : {options.StopBits}");
-        WriteInfo($"Intervalo    : {options.IntervalMs} ms");
-        WriteInfo($"NewLine      : {NewLineHelper.Describe(options.NewLineMode)}");
-        WriteInfo($"Fuente       : {(string.IsNullOrWhiteSpace(options.FilePath) ? "lista interna" : options.FilePath)}");
-        WriteInfo("Acción       : enviando gramos ASCII en loop");
-        WriteInfo("Detención    : Ctrl+C");
-        WriteInfo("==============================================");
+        try
+        {
+            runtime.Start();
+            return 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            WriteError($"No se pudo abrir el puerto {runtime.PortName}. Posible causa: puerto ocupado o sin permisos.");
+            return 4;
+        }
+        catch (IOException ex)
+        {
+            WriteError($"Error de I/O al abrir el puerto {runtime.PortName}: {ex.Message}");
+            return 5;
+        }
+        catch (Exception ex)
+        {
+            WriteError($"Error inesperado al abrir el puerto {runtime.PortName}: {ex.Message}");
+            return 6;
+        }
     }
 
-    private static void WriteSent(string portName, string weight)
+    private static void WriteLog(SimulatorLogEntry entry)
     {
-        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] PORT={portName} SENT={weight}");
+        switch (entry.Level)
+        {
+            case SimulatorLogLevel.Error:
+                WriteColoredLine(entry.Timestamp, "ERROR", entry.Message, ConsoleColor.Red);
+                break;
+
+            case SimulatorLogLevel.Sent:
+                Console.WriteLine($"[{entry.Timestamp:yyyy-MM-dd HH:mm:ss.fff}] {entry.Message}");
+                break;
+
+            default:
+                WriteColoredLine(entry.Timestamp, "INFO ", entry.Message);
+                break;
+        }
     }
 
     private static void WriteInfo(string message)
     {
-        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] INFO  {message}");
+        WriteColoredLine(DateTime.Now, "INFO ", message);
     }
 
     private static void WriteError(string message)
     {
+        WriteColoredLine(DateTime.Now, "ERROR", message, ConsoleColor.Red);
+    }
+
+    private static void WriteColoredLine(DateTime timestamp, string level, string message, ConsoleColor? color = null)
+    {
         var previousColor = Console.ForegroundColor;
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR {message}");
-        Console.ForegroundColor = previousColor;
+
+        if (color.HasValue)
+        {
+            Console.ForegroundColor = color.Value;
+        }
+
+        Console.WriteLine($"[{timestamp:yyyy-MM-dd HH:mm:ss.fff}] {level} {message}");
+
+        if (color.HasValue)
+        {
+            Console.ForegroundColor = previousColor;
+        }
     }
 }
