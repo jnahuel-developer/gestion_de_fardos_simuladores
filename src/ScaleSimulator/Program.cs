@@ -134,6 +134,16 @@ internal static class Program
             runtime.Start();
             return 0;
         }
+        catch (ArgumentException ex)
+        {
+            WriteError(ex.Message);
+            return 6;
+        }
+        catch (InvalidOperationException ex)
+        {
+            WriteError(ex.Message);
+            return 6;
+        }
         catch (UnauthorizedAccessException)
         {
             WriteError($"No se pudo abrir el puerto {runtime.PortName}. Posible causa: puerto ocupado o sin permisos.");
@@ -146,7 +156,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            WriteError($"Error inesperado al abrir el puerto {runtime.PortName}: {ex.Message}");
+            WriteError(ex.Message);
             return 6;
         }
     }
@@ -155,6 +165,10 @@ internal static class Program
     {
         switch (entry.Level)
         {
+            case SimulatorLogLevel.Warning:
+                WriteColoredLine(entry.Timestamp, "WARN ", entry.Message, ConsoleColor.Yellow);
+                break;
+
             case SimulatorLogLevel.Error:
                 WriteColoredLine(entry.Timestamp, "ERROR", entry.Message, ConsoleColor.Red);
                 break;

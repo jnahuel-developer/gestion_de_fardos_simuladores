@@ -2,20 +2,30 @@
 
 ## Objetivo
 
-Este documento define el contrato de integracion entre la aplicacion de pesajes y este simulador, con foco en el pulsador.
+Este documento define el contrato de integracion entre la aplicacion de pesajes y este simulador para ambos canales:
 
-La lectura de balanza ya existe en la app. Lo que falta incorporar es la lectura del pulsador sin usar tramas, porque el pulsador se representara exclusivamente mediante lineas de control del puerto serie.
+- balanza por tramas
+- pulsador por lineas de control
 
-## Contrato de comunicacion
+La app puede usar el simulador para probar la lectura actual en `simple-ascii` o para avanzar sobre la lectura de produccion en `w180-t`.
 
-### Balanza
+## Contrato general
 
-- La balanza se sigue leyendo por la linea de datos del mismo puerto serie.
-- El simulador envia gramos en ASCII.
-- Cada envio termina en `CRLF` o `LF`, segun la configuracion elegida al iniciar el simulador.
-- El pulsador no modifica este flujo.
+- Hay un unico puerto serie compartido por balanza y pulsador.
+- La balanza usa el canal de datos.
+- El pulsador usa lineas de control.
+- La app debe mantener un unico `SerialPort` abierto para ambos comportamientos.
 
-Ejemplos de payload de balanza:
+## Protocolos de balanza disponibles
+
+### `simple-ascii`
+
+- Es el protocolo historico del simulador.
+- Envia el peso como ASCII sin punto decimal.
+- Termina en `CRLF` o `LF`.
+- Usa los parametros serie configurados en CLI.
+
+Ejemplo:
 
 ```text
 100000\r\n
@@ -23,29 +33,56 @@ Ejemplos de payload de balanza:
 102000\r\n
 ```
 
-### Pulsador
+### `w180-t`
+
+- Es el protocolo objetivo de produccion.
+- Opera en transmision continua.
+- Usa longitud fija de 18 bytes.
+- No requiere comandos desde el host.
+- Perfil serie fijo del simulador:
+  - baudrate `9600`
+  - data bits `7`
+  - parity `Even`
+  - stop bits `2`
+  - handshake `None`
+
+Estructura:
+
+```text
+<STX><A><B><C><PESO><TARA><CR><LF>
+```
+
+Detalle de la implementacion actual del simulador:
+
+- `STX = 0x02`
+- `A = 0x00`
+- `B = 0x01`
+- `C = 0x00`
+- `PESO = 6 bytes ASCII`
+- `TARA = 6 bytes ASCII`
+- `CR = 0x0D`
+- `LF = 0x0A`
+
+Interpretacion del estado emitido por el simulador en `w180-t`:
+
+- peso neto
+- estable
+- positivo
+- en rango
+- sin tecla informada en byte `C`
+
+Ejemplo de trama para peso `1234` y tara `0`:
+
+```text
+02 00 01 00 30 30 31 32 33 34 30 30 30 30 30 30 0D 0A
+```
+
+## Pulsador
 
 - El pulsador no envia texto.
 - El pulsador no emite tramas.
 - La opresion se representa como un pulso de 500 ms sobre una linea de control.
-- El simulador usa una sola linea por vez: `RTS` o `DTR`.
 - La seleccion se hace al iniciar el simulador con `--button-line rts|dtr`.
-- Terminados los 500 ms, la linea vuelve a reposo.
-
-## Que debe hacer la aplicacion
-
-La aplicacion no debe intentar leer el pulsador desde `Read`, `ReadLine`, `ReadExisting` ni desde el parser de tramas de balanza.
-
-La aplicacion debe:
-
-1. Mantener un unico `SerialPort` abierto para balanza y pulsador.
-2. Seguir procesando la balanza exactamente igual que hoy.
-3. Agregar la observacion de una linea de entrada del puerto para detectar la opresion del pulsador.
-4. Traducir la transicion de reposo a activo en un evento de negocio del tipo `PulsadorPresionado`.
-
-## Mapeo esperado de lineas
-
-El simulador controla una linea de salida local. La aplicacion debe leer la linea de entrada remota correspondiente.
 
 Contrato de prueba recomendado:
 
@@ -54,19 +91,28 @@ Contrato de prueba recomendado:
 | `rts` | `CTS` | `SerialPort.CtsHolding` y `SerialPinChange.CtsChanged` |
 | `dtr` | `DSR` | `SerialPort.DsrHolding` y `SerialPinChange.DsrChanged` |
 
-Notas:
+## Que debe hacer la aplicacion
 
-- Este es el contrato recomendado para las pruebas con este simulador.
-- Si el hardware definitivo expone otra linea de entrada equivalente, la abstraccion de la app debe cambiar solo en el mapeo, no en la logica.
-- La app debe ser lectora de la senal del pulsador. No debe intentar enviar una trama para "confirmar" la opresion.
+La app no debe intentar leer el pulsador desde el parser de la balanza.
 
-## Diseno sugerido en la app
+La app debe:
 
-### Recomendacion de modelado
+1. Abrir un unico `SerialPort`.
+2. Elegir el parser de balanza segun el protocolo configurado.
+3. Seguir observando la linea de control configurada para detectar el pulsador.
+4. Publicar eventos de negocio distintos para lectura de balanza y opresion del pulsador.
 
-Agregar una configuracion explicita para la linea del pulsador, por ejemplo:
+## Recomendacion de modelado
+
+Separar dos decisiones de configuracion:
 
 ```csharp
+public enum ScaleProtocolKind
+{
+    SimpleAscii,
+    W180T
+}
+
 public enum ButtonInputLine
 {
     Cts,
@@ -74,26 +120,42 @@ public enum ButtonInputLine
 }
 ```
 
-Y mantener un unico componente dueno del `SerialPort`, por ejemplo:
+Y mantener un adaptador serie unico que sea dueno de:
 
-- lectura de balanza por datos
-- lectura de pulsador por linea de control
-- publicacion de eventos hacia la capa de aplicacion
+- el `SerialPort`
+- el parser de balanza activo
+- la deteccion del pulsador por `PinChanged`
 
-### Reglas de implementacion
+## Lectura sugerida de `w180-t`
 
-- Abrir un solo `SerialPort`.
-- Configurarlo con los mismos parametros que usa hoy la balanza.
-- Suscribirse a `PinChanged`.
-- Leer el estado real de la linea al recibir el cambio.
-- Detectar solo el flanco ascendente para representar la opresion.
-- No generar multiples eventos mientras la linea sigue activa durante el mismo pulso de 500 ms.
-- Si tambien se necesita "liberacion", resolverla como un segundo evento basado en el flanco descendente, pero eso no es requisito para usar este simulador.
+La app deberia:
 
-### Ejemplo de implementacion en .NET
+1. Sincronizar por `STX` (`0x02`).
+2. Leer la trama completa de 18 bytes.
+3. Verificar `CR` y `LF` al final.
+4. Interpretar los bytes `A/B/C`.
+5. Convertir `PESO` y `TARA` de ASCII a numero entero.
+6. Aplicar la escala decimal configurada por la aplicacion o por el equipo real.
+
+Campos utiles para la app:
+
+- `B bit 0`: peso neto
+- `B bit 1`: negativo
+- `B bit 2`: fuera de rango
+- `B bit 3`: inestable
+
+La implementacion actual del simulador emite esos flags en estado estable y valido, salvo que se amplie mas adelante.
+
+## Ejemplo de implementacion en .NET
 
 ```csharp
 using System.IO.Ports;
+
+public enum ScaleProtocolKind
+{
+    SimpleAscii,
+    W180T
+}
 
 public enum ButtonInputLine
 {
@@ -104,23 +166,42 @@ public enum ButtonInputLine
 public sealed class WeighingSerialAdapter : IDisposable
 {
     private readonly SerialPort _serialPort;
+    private readonly ScaleProtocolKind _scaleProtocol;
     private readonly ButtonInputLine _buttonInputLine;
     private bool _lastButtonState;
 
+    public event Action<int>? WeightReceived;
     public event Action? ButtonPressed;
 
-    public WeighingSerialAdapter(string portName, ButtonInputLine buttonInputLine)
+    public WeighingSerialAdapter(
+        string portName,
+        ScaleProtocolKind scaleProtocol,
+        ButtonInputLine buttonInputLine)
     {
+        _scaleProtocol = scaleProtocol;
         _buttonInputLine = buttonInputLine;
-        _serialPort = new SerialPort
+
+        _serialPort = scaleProtocol switch
         {
-            PortName = portName,
-            BaudRate = 9600,
-            DataBits = 8,
-            Parity = Parity.None,
-            StopBits = StopBits.One,
-            Handshake = Handshake.None,
-            NewLine = "\r\n"
+            ScaleProtocolKind.W180T => new SerialPort
+            {
+                PortName = portName,
+                BaudRate = 9600,
+                DataBits = 7,
+                Parity = Parity.Even,
+                StopBits = StopBits.Two,
+                Handshake = Handshake.None
+            },
+            _ => new SerialPort
+            {
+                PortName = portName,
+                BaudRate = 9600,
+                DataBits = 8,
+                Parity = Parity.None,
+                StopBits = StopBits.One,
+                Handshake = Handshake.None,
+                NewLine = "\r\n"
+            }
         };
     }
 
@@ -130,6 +211,50 @@ public sealed class WeighingSerialAdapter : IDisposable
         _serialPort.DataReceived += OnDataReceived;
         _serialPort.Open();
         _lastButtonState = ReadButtonState();
+    }
+
+    private void OnDataReceived(object? sender, SerialDataReceivedEventArgs e)
+    {
+        if (_scaleProtocol == ScaleProtocolKind.W180T)
+        {
+            TryReadW180TFrame();
+            return;
+        }
+
+        string line = _serialPort.ReadLine();
+        if (int.TryParse(line.Trim(), out int weight))
+        {
+            WeightReceived?.Invoke(weight);
+        }
+    }
+
+    private void TryReadW180TFrame()
+    {
+        while (_serialPort.BytesToRead >= 18)
+        {
+            if (_serialPort.ReadByte() != 0x02)
+            {
+                continue;
+            }
+
+            byte[] buffer = new byte[17];
+            int read = _serialPort.Read(buffer, 0, buffer.Length);
+            if (read < buffer.Length)
+            {
+                return;
+            }
+
+            if (buffer[15] != 0x0D || buffer[16] != 0x0A)
+            {
+                continue;
+            }
+
+            string weightAscii = System.Text.Encoding.ASCII.GetString(buffer, 3, 6);
+            if (int.TryParse(weightAscii, out int weight))
+            {
+                WeightReceived?.Invoke(weight);
+            }
+        }
     }
 
     private void OnPinChanged(object? sender, SerialPinChangedEventArgs e)
@@ -163,11 +288,6 @@ public sealed class WeighingSerialAdapter : IDisposable
         };
     }
 
-    private void OnDataReceived(object? sender, SerialDataReceivedEventArgs e)
-    {
-        // Mantener aqui la lectura actual de la balanza.
-    }
-
     public void Dispose()
     {
         _serialPort.PinChanged -= OnPinChanged;
@@ -183,79 +303,77 @@ public sealed class WeighingSerialAdapter : IDisposable
 }
 ```
 
-## Comportamiento esperado en la aplicacion
-
-Una implementacion correcta deberia cumplir esto:
-
-- La lectura de balanza sigue funcionando sin cambios de protocolo.
-- La lectura del pulsador no depende del canal de datos.
-- Una opresion manual en la UI del simulador produce un unico evento de "presionado".
-- Durante el pulso del pulsador, la balanza sigue entregando pesos normalmente.
-- Cerrar y reabrir el puerto reinicia el estado base del pulsador en reposo.
-
 ## Como probar con este simulador
 
-### Escenario 1: balanza solamente
+### Escenario 1: `simple-ascii`
 
 Ejecutar:
 
 ```powershell
-dotnet run --project src/ScaleSimulator -- --port COM3
+dotnet run --project src/ScaleSimulator -- --port COM3 --scale-protocol simple-ascii
 ```
 
 Validar:
 
-- La app recibe pesos.
-- La app no necesita cambios para este caso.
+- La app recibe pesos por parser de linea.
+- El pulsador sigue probandose con la UI si se usa `--ui`.
 
-### Escenario 2: balanza + pulsador por `RTS`
+### Escenario 2: `w180-t`
 
 Ejecutar:
 
 ```powershell
-dotnet run --project src/ScaleSimulator -- --port COM3 --ui --button-line rts
+dotnet run --project src/ScaleSimulator -- --port COM3 --ui --scale-protocol w180-t --tare 0
 ```
-
-Configurar la app para leer el pulsador desde `CTS`.
 
 Validar:
 
-- La balanza sigue entregando pesos.
-- Al hacer clic en `Pulsar 500 ms`, la app detecta una opresion.
-- La app no espera una trama adicional.
-- La app no genera multiples opresiones durante el mismo pulso.
+- La app abre el puerto en `9600 / 7E2`.
+- La app sincroniza por `STX`.
+- La app recibe tramas de 18 bytes.
+- La app interpreta `PESO` y `TARA`.
+- La app no depende de `ReadLine()` para este protocolo.
 
-### Escenario 3: balanza + pulsador por `DTR`
+### Escenario 3: cambio de protocolo
 
-Ejecutar:
+En la UI:
 
-```powershell
-dotnet run --project src/ScaleSimulator -- --port COM3 --ui --button-line dtr
-```
-
-Configurar la app para leer el pulsador desde `DSR`.
+1. Presionar `Stop`.
+2. Cambiar el protocolo en la lista.
+3. Presionar `Start`.
 
 Validar:
 
-- El comportamiento es equivalente al escenario anterior.
-- Solo cambia la linea de entrada observada por la app.
+- El puerto se reabre con el perfil serie efectivo del protocolo nuevo.
+- La app debe cambiar su parser/configuracion en consecuencia.
 
-## Criterios de aceptacion para el agente que implementa la app
+### Escenario 4: pulsador
+
+Con cualquiera de los protocolos de balanza:
+
+1. Configurar el pulsador del simulador con `--button-line rts` o `dtr`.
+2. Hacer clic en `Pulsar 500 ms`.
+
+Validar:
+
+- La balanza sigue comunicando con el protocolo activo.
+- La app detecta la opresion por `CTS` o `DSR`.
+- No existe trama de pulsador.
+
+## Criterios de aceptacion para la app
 
 - La app mantiene un unico puerto abierto para balanza y pulsador.
-- La balanza sigue parseandose por tramas ASCII.
+- La app selecciona el parser de balanza segun el protocolo configurado.
+- En `simple-ascii`, la app puede seguir leyendo por linea.
+- En `w180-t`, la app lee 18 bytes por trama y sincroniza por `STX`.
 - El pulsador se detecta por lineas de control y no por texto.
-- El mapping entre linea simulada y linea leida esta explicitado en configuracion o en codigo.
-- El evento de opresion se produce una sola vez por pulso de 500 ms.
-- El simulador puede usarse para probar ambos comportamientos al mismo tiempo.
+- La app puede probar balanza y pulsador en paralelo con este simulador.
 
 ## Resumen operativo
 
-Si el agente que desarrolla la app necesita una regla corta para implementar:
-
-- Balanza: seguir leyendo texto por datos.
+- `simple-ascii`: parser de texto por linea.
+- `w180-t`: parser binario/ASCII de 18 bytes con `STX` inicial.
 - Pulsador: leer una linea de control del mismo puerto.
-- `--button-line rts` en el simulador implica leer `CTS` en la app.
-- `--button-line dtr` en el simulador implica leer `DSR` en la app.
+- `--button-line rts` implica leer `CTS`.
+- `--button-line dtr` implica leer `DSR`.
 - La opresion se detecta por flanco ascendente.
-- No existe trama de pulsador.

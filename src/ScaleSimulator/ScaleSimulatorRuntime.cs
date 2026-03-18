@@ -9,38 +9,25 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
     private readonly object _serialSync = new();
     private readonly object _logSync = new();
-    private readonly SerialPort _serialPort;
     private readonly ScaleOptions _options;
     private readonly WeightSource _weightSource;
-    private readonly string _newLine;
-    private readonly CancellationTokenSource _runtimeCts = new();
     private readonly List<SimulatorLogEntry> _recentLogEntries = new();
 
+    private SerialPort? _serialPort;
+    private CancellationTokenSource? _runtimeCts;
     private Task? _weightLoopTask;
     private Task<bool>? _pulseTask;
-    private bool _started;
+    private ScaleProtocolKind _selectedScaleProtocol;
+    private long _tareValue;
     private int _pulseInProgress;
+    private bool _disposed;
 
     public ScaleSimulatorRuntime(ScaleOptions options, WeightSource weightSource)
     {
         _options = options;
         _weightSource = weightSource;
-        _newLine = NewLineHelper.Resolve(options.NewLineMode);
-        _serialPort = new SerialPort
-        {
-            PortName = options.PortName,
-            BaudRate = options.BaudRate,
-            DataBits = options.DataBits,
-            Parity = ParseParity(options.Parity),
-            StopBits = ParseStopBits(options.StopBits),
-            Handshake = Handshake.None,
-            Encoding = System.Text.Encoding.ASCII,
-            NewLine = _newLine,
-            DtrEnable = false,
-            RtsEnable = false,
-            ReadTimeout = 500,
-            WriteTimeout = 2000
-        };
+        _selectedScaleProtocol = options.ScaleProtocol;
+        _tareValue = options.Tare;
     }
 
     public event Action<SimulatorLogEntry>? LogEmitted;
@@ -49,6 +36,7 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
     public string PortName => _options.PortName;
     public ButtonLineMode ButtonLine => _options.ButtonLine;
+    public IReadOnlyList<IScaleProtocol> AvailableScaleProtocols => ScaleProtocolCatalog.All;
 
     public bool IsPortOpen
     {
@@ -56,69 +44,99 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
         {
             lock (_serialSync)
             {
-                return _serialPort.IsOpen;
+                return IsPortOpenUnsafe();
             }
         }
     }
 
     public bool IsPulseInProgress => Volatile.Read(ref _pulseInProgress) == 1;
 
+    public ScaleProtocolKind SelectedScaleProtocolKind
+    {
+        get
+        {
+            lock (_serialSync)
+            {
+                return _selectedScaleProtocol;
+            }
+        }
+    }
+
+    public IScaleProtocol SelectedScaleProtocol => ScaleProtocolCatalog.Get(SelectedScaleProtocolKind);
+
+    public long TareValue
+    {
+        get
+        {
+            lock (_serialSync)
+            {
+                return _tareValue;
+            }
+        }
+    }
+
     public void Start()
     {
-        if (_started)
-        {
-            throw new InvalidOperationException("El simulador ya esta iniciado.");
-        }
+        ThrowIfDisposed();
+
+        IScaleProtocol protocol;
+        SerialProfile profile;
+        SerialPort serialPort;
+        CancellationTokenSource cts;
 
         lock (_serialSync)
         {
-            _serialPort.Open();
+            if (IsPortOpenUnsafe())
+            {
+                throw new InvalidOperationException("La comunicacion de balanza ya esta activa.");
+            }
+
+            protocol = ScaleProtocolCatalog.Get(_selectedScaleProtocol);
+            protocol.ValidateConfiguration(_weightSource, _tareValue);
+            profile = protocol.ResolveSerialSettings(_options);
+            serialPort = profile.CreatePort(_options.PortName);
+            serialPort.Open();
+            _serialPort = serialPort;
             ResetControlLinesUnsafe();
+
+            cts = new CancellationTokenSource();
+            _runtimeCts = cts;
+            _weightLoopTask = Task.Run(() => RunWeightLoopAsync(cts.Token));
         }
 
-        _started = true;
+        LogProtocolWarnings(protocol);
         PortStateChanged?.Invoke(true);
-        WriteHeader();
-        _weightLoopTask = Task.Run(() => RunWeightLoopAsync(_runtimeCts.Token));
-    }
-
-    public Task<bool> PulseButtonAsync()
-    {
-        if (!_started || _runtimeCts.IsCancellationRequested)
-        {
-            return Task.FromResult(false);
-        }
-
-        if (Interlocked.CompareExchange(ref _pulseInProgress, 1, 0) != 0)
-        {
-            return Task.FromResult(false);
-        }
-
-        var pulseTask = ExecutePulseAsync();
-        _pulseTask = pulseTask;
-        return pulseTask;
-    }
-
-    public IReadOnlyList<SimulatorLogEntry> GetRecentLogs()
-    {
-        lock (_logSync)
-        {
-            return _recentLogEntries.ToArray();
-        }
+        WriteHeader(protocol);
     }
 
     public void Stop()
     {
-        if (!_started)
+        ThrowIfDisposed();
+
+        CancellationTokenSource? cts;
+        Task? weightLoopTask;
+        Task<bool>? pulseTask;
+        SerialPort? portToDispose = null;
+
+        lock (_serialSync)
         {
-            return;
+            if (!IsPortOpenUnsafe() && _runtimeCts is null && _weightLoopTask is null)
+            {
+                return;
+            }
+
+            cts = _runtimeCts;
+            weightLoopTask = _weightLoopTask;
+            pulseTask = _pulseTask;
+            _runtimeCts = null;
+            _weightLoopTask = null;
         }
 
-        _runtimeCts.Cancel();
+        cts?.Cancel();
 
         try
         {
-            _pulseTask?.GetAwaiter().GetResult();
+            pulseTask?.GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {
@@ -131,7 +149,7 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
         try
         {
-            _weightLoopTask?.GetAwaiter().GetResult();
+            weightLoopTask?.GetAwaiter().GetResult();
         }
         catch (OperationCanceledException)
         {
@@ -144,35 +162,143 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
         lock (_serialSync)
         {
-            TryResetControlLinesUnsafe();
-
-            if (_serialPort.IsOpen)
+            if (_serialPort is not null)
             {
-                _serialPort.Close();
+                TryResetControlLinesUnsafe();
+
+                if (_serialPort.IsOpen)
+                {
+                    _serialPort.Close();
+                }
+
+                portToDispose = _serialPort;
+                _serialPort = null;
             }
         }
 
-        _started = false;
+        portToDispose?.Dispose();
+        cts?.Dispose();
+
         PortStateChanged?.Invoke(false);
-        LogInfo($"Puerto {PortName} cerrado. Fin del simulador.");
+        LogInfo($"Puerto {PortName} cerrado. Comunicacion detenida.");
+    }
+
+    public Task<bool> PulseButtonAsync()
+    {
+        ThrowIfDisposed();
+
+        CancellationToken cancellationToken;
+        string lineName = ButtonLineHelper.Describe(_options.ButtonLine);
+
+        lock (_serialSync)
+        {
+            if (!IsPortOpenUnsafe() || _runtimeCts is null)
+            {
+                return Task.FromResult(false);
+            }
+
+            cancellationToken = _runtimeCts.Token;
+        }
+
+        if (Interlocked.CompareExchange(ref _pulseInProgress, 1, 0) != 0)
+        {
+            return Task.FromResult(false);
+        }
+
+        Task<bool> pulseTask = ExecutePulseAsync(cancellationToken, lineName);
+
+        lock (_serialSync)
+        {
+            _pulseTask = pulseTask;
+        }
+
+        return pulseTask;
+    }
+
+    public IReadOnlyList<SimulatorLogEntry> GetRecentLogs()
+    {
+        lock (_logSync)
+        {
+            return _recentLogEntries.ToArray();
+        }
+    }
+
+    public SerialProfile GetEffectiveSerialProfile()
+    {
+        return SelectedScaleProtocol.ResolveSerialSettings(_options);
+    }
+
+    public string GetEffectiveSerialProfileSummary()
+    {
+        string summary = GetEffectiveSerialProfile().Describe();
+
+        if (SelectedScaleProtocolKind == ScaleProtocolKind.SimpleAscii)
+        {
+            summary += $" / NewLine {NewLineHelper.Describe(_options.NewLineMode)}";
+        }
+        else
+        {
+            summary += " / CRLF fijo";
+        }
+
+        return summary;
+    }
+
+    public void SetScaleProtocol(ScaleProtocolKind protocolKind)
+    {
+        ThrowIfDisposed();
+
+        lock (_serialSync)
+        {
+            if (IsPortOpenUnsafe())
+            {
+                throw new InvalidOperationException("Debe detener la comunicacion antes de cambiar el protocolo.");
+            }
+
+            _selectedScaleProtocol = protocolKind;
+        }
+
+        LogInfo($"Balanza: protocolo seleccionado {ScaleProtocolKindHelper.Describe(protocolKind)}.");
+    }
+
+    public void SetTare(long tareValue)
+    {
+        ThrowIfDisposed();
+
+        if (tareValue < 0 || tareValue > ScaleOptions.MaxTareValue)
+        {
+            throw new ArgumentException(
+                $"La tara debe estar entre 0 y {ScaleOptions.MaxTareValue}.",
+                nameof(tareValue));
+        }
+
+        lock (_serialSync)
+        {
+            _tareValue = tareValue;
+        }
     }
 
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         Stop();
-        _serialPort.Dispose();
-        _runtimeCts.Dispose();
+        _disposed = true;
     }
 
     private async Task RunWeightLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            string weight = _weightSource.Next();
+            ScaleReading reading = _weightSource.Next(TareValue);
+            IScaleProtocol protocol = SelectedScaleProtocol;
 
             try
             {
-                WriteWeight(weight);
+                WriteReading(protocol, reading);
             }
             catch (TimeoutException ex)
             {
@@ -186,6 +312,10 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
             {
                 LogError($"Puerto no disponible al escribir en {PortName}: {ex.Message}");
             }
+            catch (Exception ex)
+            {
+                LogError($"Error enviando trama del protocolo {protocol.Id}: {ex.Message}");
+            }
 
             try
             {
@@ -198,9 +328,8 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
         }
     }
 
-    private async Task<bool> ExecutePulseAsync()
+    private async Task<bool> ExecutePulseAsync(CancellationToken cancellationToken, string lineName)
     {
-        string lineName = ButtonLineHelper.Describe(_options.ButtonLine);
         bool lineActivated = false;
 
         PulseStateChanged?.Invoke(true);
@@ -213,7 +342,7 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
             try
             {
-                await Task.Delay(ButtonPulseDurationMs, _runtimeCts.Token);
+                await Task.Delay(ButtonPulseDurationMs, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -235,23 +364,27 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
                 LogInfo($"Pulsador: fin de pulso sobre {lineName}.");
             }
 
-            _pulseTask = null;
+            lock (_serialSync)
+            {
+                _pulseTask = null;
+            }
+
             Interlocked.Exchange(ref _pulseInProgress, 0);
             PulseStateChanged?.Invoke(false);
         }
     }
 
-    private void WriteWeight(string weight)
+    private void WriteReading(IScaleProtocol protocol, ScaleReading reading)
     {
-        string payload = weight + _newLine;
+        byte[] payload = protocol.EncodeFrame(reading, _options);
 
         lock (_serialSync)
         {
             EnsurePortOpen();
-            _serialPort.Write(payload);
+            _serialPort!.Write(payload, 0, payload.Length);
         }
 
-        LogSent($"PORT={PortName} SENT={weight}");
+        LogSent($"PORT={PortName} PROTOCOL={protocol.Id} {protocol.DescribeFrame(reading)}");
     }
 
     private void SetSelectedButtonLine(bool active)
@@ -260,7 +393,7 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
         {
             EnsurePortOpen();
 
-            _serialPort.DtrEnable = _options.ButtonLine == ButtonLineMode.Dtr && active;
+            _serialPort!.DtrEnable = _options.ButtonLine == ButtonLineMode.Dtr && active;
             _serialPort.RtsEnable = _options.ButtonLine == ButtonLineMode.Rts && active;
         }
     }
@@ -277,7 +410,7 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
     {
         try
         {
-            if (_serialPort.IsOpen)
+            if (IsPortOpenUnsafe())
             {
                 ResetControlLinesUnsafe();
             }
@@ -290,43 +423,74 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
 
     private void ResetControlLinesUnsafe()
     {
-        _serialPort.DtrEnable = false;
+        _serialPort!.DtrEnable = false;
         _serialPort.RtsEnable = false;
     }
 
     private void EnsurePortOpen()
     {
-        if (!_serialPort.IsOpen)
+        if (!IsPortOpenUnsafe())
         {
             throw new InvalidOperationException($"El puerto {PortName} no esta abierto.");
         }
     }
 
-    private void WriteHeader()
+    private bool IsPortOpenUnsafe()
+    {
+        return _serialPort?.IsOpen == true;
+    }
+
+    private void WriteHeader(IScaleProtocol protocol)
     {
         LogInfo("==============================================");
         LogInfo("ScaleSimulator - Simulador de balanza y pulsador");
         LogInfo("==============================================");
         LogInfo($"Puerto       : {_options.PortName}");
-        LogInfo($"BaudRate     : {_options.BaudRate}");
-        LogInfo($"DataBits     : {_options.DataBits}");
-        LogInfo($"Parity       : {_options.Parity}");
-        LogInfo($"StopBits     : {_options.StopBits}");
+        LogInfo($"Protocolo    : {protocol.DisplayName}");
+        LogInfo($"Perfil serie : {GetEffectiveSerialProfileSummary()}");
         LogInfo($"Intervalo    : {_options.IntervalMs} ms");
-        LogInfo($"NewLine      : {NewLineHelper.Describe(_options.NewLineMode)}");
         LogInfo($"Fuente       : {(string.IsNullOrWhiteSpace(_options.FilePath) ? "lista interna" : _options.FilePath)}");
         LogInfo($"Interfaz     : {(_options.UseUi ? "mini UI" : "consola")}");
         LogInfo($"Pulsador     : linea {ButtonLineHelper.Describe(_options.ButtonLine)}");
         LogInfo($"Pulso        : {ButtonPulseDurationMs} ms");
-        LogInfo("Balanza      : gramos ASCII en loop");
+
+        if (protocol.SupportsTare)
+        {
+            LogInfo($"Tara         : {TareValue}");
+        }
+
+        LogInfo("Balanza      : transmision continua");
         LogInfo("Pulsador     : sin tramas, solo lineas de control");
-        LogInfo("Detencion    : Ctrl+C o cierre de ventana");
+        LogInfo("Detencion    : Ctrl+C, Stop o cierre de ventana");
         LogInfo("==============================================");
+    }
+
+    private void LogProtocolWarnings(IScaleProtocol protocol)
+    {
+        if (protocol.Kind != ScaleProtocolKind.W180T)
+        {
+            return;
+        }
+
+        if (_options.BaudRateWasSpecified
+            || _options.DataBitsWasSpecified
+            || _options.StopBitsWasSpecified
+            || _options.ParityWasSpecified
+            || _options.NewLineWasSpecified)
+        {
+            LogWarning(
+                "W180-T ignora --baud, --databits, --stopbits, --parity y --newline. El perfil efectivo es 9600 / 7E2 / CRLF fijo.");
+        }
     }
 
     private void LogInfo(string message)
     {
         EmitLog(SimulatorLogLevel.Info, message);
+    }
+
+    private void LogWarning(string message)
+    {
+        EmitLog(SimulatorLogLevel.Warning, message);
     }
 
     private void LogError(string message)
@@ -356,24 +520,8 @@ internal sealed class ScaleSimulatorRuntime : IDisposable
         LogEmitted?.Invoke(entry);
     }
 
-    private static Parity ParseParity(string value)
+    private void ThrowIfDisposed()
     {
-        if (Enum.TryParse<Parity>(value, ignoreCase: true, out var parity))
-        {
-            return parity;
-        }
-
-        throw new ArgumentException(
-            $"Valor de paridad invalido: '{value}'. Valores soportados: None, Odd, Even, Mark, Space.");
-    }
-
-    private static StopBits ParseStopBits(int value)
-    {
-        return value switch
-        {
-            1 => StopBits.One,
-            2 => StopBits.Two,
-            _ => throw new ArgumentException("El valor de --stopbits debe ser 1 o 2.")
-        };
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 }

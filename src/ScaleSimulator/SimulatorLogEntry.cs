@@ -3,6 +3,7 @@ namespace ScaleSimulator;
 internal enum SimulatorLogLevel
 {
     Info,
+    Warning,
     Error,
     Sent
 }
@@ -13,6 +14,7 @@ internal readonly record struct SimulatorLogEntry(DateTime Timestamp, SimulatorL
     {
         string prefix = Level switch
         {
+            SimulatorLogLevel.Warning => "WARN ",
             SimulatorLogLevel.Error => "ERROR",
             SimulatorLogLevel.Sent => "SENT ",
             _ => "INFO "
